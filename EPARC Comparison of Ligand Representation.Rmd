@@ -1,0 +1,144 @@
+---
+title: "EPARC Comparison of Ligand Representations"
+author: "Lucy Wang"
+date: "01/14/2021"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(knitr)
+library(reshape2)
+library(xlsx)
+library(rstatix)
+library(PMCMRplus)
+
+knitr::opts_chunk$set(fig.width = 8, message=F, 
+                      echo=T, tidy.opts=list(width.cutoff=60), 
+                      tidy=T)
+
+
+setwd("/Users/lucywang/Google Drive/Doyle Lab/Final PARC Epoxide")
+```
+
+# Preprocessing 
+Import the RMSE set for ANOVA. `df.rmse0`, a wide data frame, should have the following features: 
+
+* `Split_Index`: a factor variable containing the fold index of the 5x2 CV; each coordination should have indices 1-10
+* `RMSE`: a numeric vector of RMSEs 
+* `Coordination`: a factor vector denoting coordination state (e.g. NiArCl, NiF2, free ligand)
+* `Set`: a factor vector denoting whether the RMSE refers to the training or test set RMSE. 
+
+To create pairwise averages, an additional vector will be appended to the above data frame. It will be (1,1,2,2,..,5,5,), repeated for however many coordination states there exist. 
+
+```{r read_rmse}
+df.rmse0<-read.csv("PARC Epoxide Model RMSE Comparison.csv")
+  
+  # Change coordination to factor
+  df.rmse0$Coordination<-as.factor(df.rmse$Coordination)
+
+  # Create pair index
+  df.rmse<-data.frame(df.rmse0, 
+                      "Pair"=rep(rep(1:5, each=2)))
+
+  # Subset out the test set 
+df.rmse0.ts<-df.rmse[df.rmse$Set=="Test",]
+  
+  # Find average of pairs 
+df.rmse.ts<-melt(t(tapply(df.rmse0.ts$RMSE, 
+         list(df.rmse0.ts$Coordination, df.rmse0.ts$Pair), 
+         mean)))
+
+  #Rename columns of melted df 
+colnames(df.rmse.ts)<-c("Pair", 
+                        "Coordination", 
+                        "RMSE")
+
+# Display the first few rows 
+kable(head(
+  df.rmse.ts, 8
+))
+```
+
+Summary statistics of the test RMSEs (pairwise average) by coordination state. 
+
+```{r rmse_summary}
+# Find average of pairwise-averaged test RMSE
+kable(data.frame("Average pairwise-averaged test RMSE"=round(tapply(df.rmse.ts$RMSE, 
+                    INDEX=df.rmse.ts$Coordination, 
+                    mean), 3), 
+                  "SD pairwise-averaged test RMSE"=
+                    round(tapply(df.rmse.ts$RMSE, 
+                    INDEX=df.rmse.ts$Coordination, 
+                    sd), 3))
+)
+```
+
+Plot the pairwise-averaged RMSEs. 
+
+```{r rmse_summary}
+#Plot 
+ggplot(df.rmse.ts, 
+       aes(x=Coordination, y=RMSE, 
+           color=Coordination))+
+  geom_violin() + 
+  ggtitle("Test RMSE of 5x2 Cross Validation")
+```
+
+# Hypothesis Test
+Before one-way ANOVA with repeated measures, check that data is normally distributed (Shapiro-Wilk). 
+
+```{r normality}
+# outliers 
+df.rmse.ts %>%
+  group_by(Coordination) %>%
+  shapiro_test(RMSE)
+
+# q-q plot 
+ggplot(df.rmse.ts, 
+       aes(sample=RMSE, 
+           color=Coordination))+
+  geom_qq() + 
+  geom_qq_line()+
+  facet_grid(rows=vars(Coordination)) + 
+  ggtitle("Q-Q Plot of 5x2 CV Test RMSE")
+  
+```
+
+Although there is slight right skew of NiF2 distribution, ANOVA is relatively robust against normality violations, and can be used with caution. Post-hoc paired-t tests with Holm adjustment to the p-value will be conducted if ANOVA displays significance 
+
+```{r anova}
+#repeated measures (within-subject)
+res.aov.within <- anova_test(data = df.rmse.ts,  dv= RMSE, wid = Pair, within = Coordination)
+get_anova_table(res.aov.within)
+
+#post-hoc comparisons 
+pwc <- df.rmse.ts %>%
+  pairwise_t_test(
+    RMSE ~ Coordination, paired = TRUE,
+    p.adjust.method = "holm"
+    )
+
+# Display post-hoc results 
+pwc
+```
+
+Non-parametric Friedman test with post hoc comparisons using Nemenyi's test (from `PMCMRplus` package). 
+
+```{r friedman}
+#Friedman test 
+res.fried <- df.rmse.ts %>% friedman_test(RMSE ~ Coordination|Pair)
+
+# post hoc comparisons using Nemenyi's all pairs comparison tests of Friedman-typed rank 
+  #Nemenyi 
+pwc.fried<-frdAllPairsNemenyiTest(df.rmse.ts$RMSE, 
+                                  groups=df.rmse.ts$Coordination, 
+                                  blocks=df.rmse.ts$Pair, 
+                                  p.adjust.method="holm")
+# Show results
+pwc.fried
+```
