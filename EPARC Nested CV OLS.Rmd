@@ -1,5 +1,5 @@
 ---
-title: "PARC Epoxide: Repeated Stratified Nested Cross-Validation"
+title: "EPARC Nested CV OLS"
 author: "Lucy Wang"
 date: "12/24/2020"
 output: 
