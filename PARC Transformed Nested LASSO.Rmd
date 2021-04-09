@@ -1,5 +1,5 @@
 ---
-title: "EPARC Nested LASSO"
+title: "NiArCl: Final Optimized PARC-LASSO"
 author: "Lucy Wang"
 date: "12/24/2020"
 output: 
@@ -14,11 +14,7 @@ library(ggplot2)
 library(dplyr)
 library(knitr)
 library(reshape2)
-library(GGally)
-library(leaps)
 library(caret)
-library(xlsx)
-library(gridExtra)
 library(glmnet)
 
 knitr::opts_chunk$set(fig.width = 8, message=F, 
@@ -26,66 +22,66 @@ knitr::opts_chunk$set(fig.width = 8, message=F,
                       tidy=T)
 
 
-setwd("/Users/lucywang/Google Drive/Doyle Lab/Final EPARC Epoxide")
-```
-
-Let's also define some useful functions
-```{r functions}
-
-# RMSE
-rmse.f<-function(x, y){
-  sqrt(mean((x-y)^2))
-}
-
-# Whenever we call something from a list in a function adn then 
-# use sapply(), the columns of our dataframe are lists rather than vectors
-# I'll run a simple function called unlist.f to help us unlist 
-unlist.f<-function(df){
-  #Number of columns in data frame 
-  n<-ncol(df)
-  for(i in 1:n){
-    df[,i]<-unlist(df[,i])
-  }
-  return(df)
-}
+setwd("/Users/lucywang/Google Drive/Doyle Lab/PARC 2/PARC Modeling")
 ```
 
 # Preprocessing 
 
 ## Reading in Data 
 
-Read in df, Remove ee (as ΔΔG^‡^ are calculated from them) and ArCl, a character vector containing ligand names. For demonstration purposes, we are importing NiArCl dataset. 
+Read in df, Define function `prep.f` that will preprocess the data, returning the processed dataframe 
+
+`prep.f` takes the following arguments 
+* `data`: the raw dataframe 
+* `output`: a character string of output; here, we're interested in Yield, but can also change to another output like $\Delta \Delta G ^ {‡}$
+* `transform`: a logical argument; if `transform=T`, applies log transformation on output 
 
 ```{r read_in}
-df<-na.omit(read.csv("/Users/lucywang/Google Drive/Doyle Lab/Final EPARC Epoxide/[Export] Final Optimized PARC Epoxide NiArCl.csv"))
+df0<-na.omit(read.csv("Parc Ni Sty.csv"))
+  epx="Styrene Oxides"
 
-# Set aside ArCl names as a vector
-ar<-df$ArCl
+prep.f<-function(data, 
+                 output="Yield", transform=F){
+#change η to dent for convenience 
+colnames(data)[which(colnames(data)=="η")]<-"dent"
 
-# Define coordination, a handy character vector for labeling graphs
-coordination<-"LNiArCl"
-
-# Delete some redundant variables 
-df<-df[, -c(grep("ee",colnames(df)), 
-           grep("ArCl",colnames(df)))]
-
-#L.Class as factor variable
-df$L.Class<-as.factor(df$L.Class)
+#Class and denticity as factor variable
+data$Class<-as.factor(data$Class)
+data$dent<-as.factor(data$dent)
 
 # ID as character variable
-df$ID<-as.character(df$ID)
+data$ID<-as.character(data$ID)
 
-# Change torsions to positive values 
-df$Torsion<-abs(df$Torsion)
+#Delete ddG output and denticity
+
+ifelse(output=="Yield", 
+       data<-data[,-c(
+  grep("ddG", colnames(data)), 
+  grep("dent", colnames(data))
+)], 
+data<-data[,-c(
+  grep("dent", colnames(data)), 
+  grep("Yield", colnames(data))
+)])
+
+# Transform
+
+if(transform==T){
+  data[,grep(output, colnames(data))]<-log(data[,grep(output, colnames(data))])
   
-# Check structure 
-str(df)
+  # rename column
+  colnames(data)[grep(output, colnames(data))]<-paste(c("ln", output), 
+                                                                 collapse="")
+}
 
-#Number of observations
-m<-nrow(df)
+return(data)
+}
 
-# change output to ddG for simplicity 
-colnames(df)[2]<-"ddG"
+# Process data 
+df<-prep.f(df0, transform=T)
+
+# Define output as character string 
+dv<-colnames(df)[3]
 
 # define lambda for later use 
 lambda="lambda.1se"
@@ -100,14 +96,12 @@ A repeated 4-fold (75-25) cross-validation, stratified split by ligand class (Bi
 We will also define some important variables: 
 * `k.out`: number of folds to create for the outer loop (here, `k.out`=4)
 * `l.out`: number of repeats to create for the outer loop (here, `l.out`=5)
-* `n.out`: $k.out*l.out$, the total number of folds in the outer loop (here, `n.out`=20)
+* `n.out`: $k.out*l.out$, the totaly number of folds in the outer loop (here, `n.out`=20)
 
 ```{r outer_var}
-# Define some pertinent variables for this outer loop 
 k.out<-4
 l.out<-5
-  # total number of TV-Test Splits 
-  n.out<-k.out*l.out
+n.out<-k.out*l.out
 ```
 
 We will proceed with the splitting for the outer loop. `createMultiFolds()` outputs a list of indices for the training-validation set. 
@@ -115,47 +109,48 @@ We will proceed with the splitting for the outer loop. `createMultiFolds()` outp
 * `fold_idx`: the list of indices that determine each fold 
 * `df0`: the dataframe for splitting 
 
-```{r split_trainvaltest}
+```{r outer_split}
 # Set seed 
 set.seed(1997, sample.kind="Rejection")
 
-# Create Multiple folds index
-folds.tvts<-createMultiFolds(df$L.Class, k=k.out, times=l.out)
+# Create outer repeated cv fold index
+out_fold_idx<-createMultiFolds(df$Class, k=k.out, times=l.out)
 
 # Write function that will take the indices of folds and split them 
-# According to the indices in folds.tvts
+# According to the indices in out_fold_idx
+# if the argument tv=T, function will return training-validation folds 
+# else, test folds
 
-split.tvts.f<-function(i, tv=TRUE){
+split.out.f<-function(i.out, df0=df, fold_idx=out_fold_idx, tv=TRUE){
   if(tv==TRUE){
-  # print tv set 
-  return(df[folds.tvts[[i]],]
+  # return tv set 
+  return(df0[fold_idx[[i.out]],]
   )
     }
   
 # Otherwise, 
  # print test set 
- return(df[-folds.tvts[[i]],]
+ return(df0[-fold_idx[[i.out]],]
         )
 }
 
 ```
 
 For $i.out$ in $1,2,...,n.out$, we will use `split.out.f` to create the training-validation and test sets. We do this using `lapply()`, thus creating a list of `n.out` training-validation sets and a similar list of test sets. 
+```{r outer_split_save}
 
-```{r save_tvtestsplit}
-# Pass split.tvts.f through lapply
   # TV
-  tv.l<-lapply(1:(k.out*l.out), 
-       FUN=split.tvts.f, 
-       tv=TRUE)
+  tv.l<-lapply(1:n.out, 
+       FUN=split.out.f, 
+       tv=T)
 
   # Test
   ts.l<-lapply(1:(k.out*l.out), 
-       FUN=split.tvts.f, 
+       FUN=split.out.f, 
        tv=F)
 ```
 
-Note that `tv.l[[i.out]]` $\cup$ `ts.l[[i]]` yields `df`.
+Note that `tv.l[[i.out]]` $\cup$ `ts.l[[i]]` yields `df`. 
 
 We'll move on with feature scaling. 
 
@@ -175,16 +170,16 @@ It's important to save `the means and standard deviations of the tv sets as they
 ```{r scale_fun}
 mean_sc<-list()
 
-scale.f<-function(i.out, tv_list,
+scale.f<-function(i, tv_list,
                   center=FALSE, 
                   scale=FALSE, 
                   dfs=FALSE
                   ){
   # define x to be ith data frame in list 
-  x<-tv_list[[i.out]]
+  x<-tv_list[[i]]
   # Remove non-numerical variables 
   x.num<-x[,-c(
-  grep("L.Class", colnames(x)), 
+  grep("Class", colnames(x)), 
   grep("ID", colnames(x))
 )]
   # Define character vector of column names 
@@ -212,7 +207,63 @@ scale.f<-function(i.out, tv_list,
       # add back ID and ligand class
       x.sc<-data.frame(ID=x$ID, 
                       x.sc0, 
-                     L.Class=x$L.Class)
+                     Class=x$Class)
+      # save 
+      return(x.sc)
+    }
+}
+
+```
+
+```{r scale_f}
+
+scale.f<-function(i.out, tv_list,
+                  center=FALSE, 
+                  scale=FALSE, 
+                  dfs=FALSE
+                  ){
+  
+  # define x to be ith data frame in list 
+  x<-tv_list[[i.out]]
+  
+  # Because scale() only takes numerical data, 
+  #remove non-numerical feature Ligand class and ID
+  #and call the resulting numerical data frame x.num
+  
+  x.num<-x[,-c(
+  grep("Class", colnames(x)), 
+  grep("ID", colnames(x))
+)]
+  
+  # Define character vector of column names 
+  x.num.colnames<-colnames(x.num)
+  
+  # Scale and center 
+  x.sc0<-scale(x.num)
+  
+    # Save mean 
+    if(center==TRUE){
+      return(attr(x.sc0, "scaled:center"))
+    }
+
+    # Save sd
+    if(scale==TRUE){
+      return(attr(x.sc0, "scaled:scale"))
+    }
+  
+    # Save scaled tv matrix 
+    
+    if(dfs==TRUE){
+      # Convert to data frame
+      x.sc0<-as.data.frame(x.sc0)
+      
+      # add back colnames 
+      colnames(x.sc0)<-x.num.colnames
+      
+      # add back ID and ligand class
+      x.sc<-data.frame(ID=x$ID, 
+                      x.sc0, 
+                     Class=x$Class)
       # save 
       return(x.sc)
     }
@@ -221,7 +272,6 @@ scale.f<-function(i.out, tv_list,
 ```
 
 Pass all `n.out` tv sets through `scale.f()` and save in list. Also save the means and standard deviations used for scaling. 
-
 ```{r scale_save}
 # Concatenate scaled tv dfs 
 tv.sc.l<-lapply(1:n.out, 
@@ -243,7 +293,7 @@ tv.sd.l<-lapply(1:n.out,
 ```
 
 
-We'll also need to scale our test set using scaling data from our tv set. 
+We will now continue on with LASSO. 
 
 ### Scaling the Test Set 
 
@@ -261,10 +311,10 @@ scale.ts.f<-function(i.out,
   # Call test set 
   test<-test_list[[i.out]]
   
-  # Remove ID, L.Class 
+  # Remove ID, Class 
   test.num<-test[,-c(
     grep("ID", colnames(test)), 
-    grep("L.Class", colnames(test))
+    grep("Class", colnames(test))
   )]
   
   # Call center from list 
@@ -279,18 +329,18 @@ scale.ts.f<-function(i.out,
                   center=center.i, 
                   scale=scale.i)
   
-  # convert to df, add back ID and L.Class
+  # convert to df, add back ID and Class
   test.sc<-data.frame(
     "ID"=test$ID, 
     as.data.frame(test.sc0), 
-    "L.Class"=test$L.Class
+    "Class"=test$Class
   )
   
   # return 
   return(test.sc)
 }
 
-#Apply our function 
+# Apply our function 
 ts.sc.l<-lapply(1:n.out, 
        FUN=scale.ts.f, 
        ts.l, 
@@ -313,7 +363,7 @@ We will now continue on with feature selection using LASSO.
   
 Observe that when $\lambda=0$, the cost function reduces to OLS.
 
-We will first split our training-validation and test data into input matrix and output ddG vector (y). 
+We will first split our training-validation and test data into input matrix and output lnYield vector (y). 
 
 ## Split TV X, y
 
@@ -326,21 +376,34 @@ splitxy.f<-function(i.out,
   # call scaled tv set
   tv<-scaled_list[[i.out]]
   
-  # input parameters with ID and L.Class removed 
+  # input parameters with ID and Class removed 
     tv.x<-tv[,-c(
       grep("ID", colnames(tv)), 
-      grep("ddG", colnames(tv)), 
-      grep("L.Class", colnames(tv))
+      grep(dv, colnames(tv)), 
+      grep("Class", colnames(tv))
     )]
     
   # output vector
-    tv.y<-tv$ddG
+    tv.y<-tv$lnYield
   
     # ifelse() to determine returned object depending on output arg
   ifelse(output==T, 
          return(tv.y), 
          return(tv.x)
   )
+}
+
+# Also define rmse.f, which calculates rmse 
+rmse.f<-function(x,y){
+  return(sqrt(mean((x-y)^2)))
+}
+
+unlist.f<-function(x){
+  for(i in 1:ncol(x)){
+    x[,i]<-unlist(x[,i])
+  }
+  
+  return(x)
 }
 ```
 
@@ -354,7 +417,7 @@ tv.sc.x.l<-lapply(
   tv.sc.l, 
 )
 
-# create list of output ddG vectors for each scaled tv 
+# create list of output lnYield vectors for each scaled tv 
 tv.sc.y.l<-lapply(
   1:n.out, 
   FUN=splitxy.f, 
@@ -369,7 +432,7 @@ ts.sc.x.l<-lapply(
   ts.sc.l, 
 )
 
-# create list of output ddG vectors for each scaled test set
+# create list of output lnYield vectors for each scaled test set
 ts.sc.y.l<-lapply(
   1:n.out, 
   FUN=splitxy.f, 
@@ -377,6 +440,7 @@ ts.sc.y.l<-lapply(
   output=T
 )
 ```
+
 
 Great! We'll now write our function that performs LASSO. 
 
@@ -391,7 +455,6 @@ From cross-validation, $\lambda$ can be chosen two different ways (from `cv.glmn
     
 We can write this information into an argument called `lmd` that takes on either `lambda.min` or `lambda.1se`. In a previous code chunk, we had set `lambda` equal to "lambda.1se". 
 
-
 ```{r lasso_f, warning=F}
 lasso.f<-function(i.out,
                   scaled_tv_x=tv.sc.x.l, 
@@ -400,14 +463,12 @@ lasso.f<-function(i.out,
                   scaled_test_y=ts.sc.y.l,
                   scaled_tv=tv.sc.l,
                   scaled_test=ts.sc.l,
-                  mean_list=tv.mean.l, 
-                  scale_list=tv.sd.l,
                   a=1, 
-                  lmd=lambda, output="ddG"){
+                  lmd=lambda){
 # call input matrix x (tv)
   x.train<-as.matrix(scaled_tv_x[[i.out]])
   
-# call output ddG vector y (tv)
+# call output lnYield vector y (tv)
   y.train<-scaled_tv_y[[i.out]]
   
 # call scaled within test set 
@@ -416,16 +477,11 @@ lasso.f<-function(i.out,
 # call input matrix (test)
    x.test<-as.matrix(scaled_test_x[[i.out]])
    
-# call output ddG vector y (test)
+# call output lnYield vector y (test)
    y.test<-scaled_test_y[[i.out]]
 
 # call scaled  within test set 
   test<-scaled_test[[i.out]]
-  
-# call mean and sd of ddG for rescaling 
-  mean<-mean_list[[i.out]][output]
-  sd<-scale_list[[i.out]][output]
-  
   
 # fit linear regression with LASSO penalty 
   # using 10-fold CV to find value of lambda 
@@ -444,7 +500,15 @@ lasso.f<-function(i.out,
                                        sep=""))), 
                           newx=x.test)
   
-  # Predict training data 
+# Make data frame comparing predicted to actual 
+  df.pred.test<-data.frame(
+    "ID"=test$ID, 
+    "Predicted Transformed"=as.numeric(alpha1.predict.test), 
+    "Measured Transformed"=y.test, 
+    "Class"=test$Class
+  )
+  
+# Predict training data 
   alpha1.predict.train<-predict(alpha1.fit, 
                           s=eval(parse(
                             text=
@@ -454,42 +518,21 @@ lasso.f<-function(i.out,
                             ),
                           newx=x.train)
   
-# Make data frame comparing predicted to actual for test 
-  df.pred.test<-data.frame(
-    "ID"=test$ID, 
-    "Predicted"=as.numeric(alpha1.predict.test), 
-    "Measured"=y.test, 
-    "Predicted Rescaled"=as.numeric(alpha1.predict.test)*sd+mean, 
-    "Measured Rescaled"=y.test*sd+mean, 
-    "L.Class"=test$L.Class
-  )
-
-  
 # Make data frame comparing predicted to actual 
   df.pred.train<-data.frame(
     "ID"=train$ID, 
-    "Predicted"= as.numeric(alpha1.predict.train), 
-    "Measured"=y.train, 
-    "Predicted Rescaled"=as.numeric(alpha1.predict.train)*sd+mean, 
-    "Measured Rescaled"=y.train*sd+mean, 
-    "L.Class"=train$L.Class
+    "Predicted Transformed"= as.numeric(alpha1.predict.train), 
+    "Measured Transformed"=y.train, 
+    "Class"=train$Class
   )
   
 # Finally, return RMSE values 
 rmse<-c(rmse.f(df.pred.test[,2], 
                df.pred.test[,3]), 
         rmse.f(df.pred.train[,2], 
-               df.pred.train[,3]), 
-        rmse.f(df.pred.test[,4], 
-               df.pred.test[,5]), 
-        rmse.f(df.pred.train[,4], 
-               df.pred.train[,5])
-)
-
-  names(rmse)<-c("Test Unscaled", 
-                 "Train Unscaled", 
-                 "Test Rescaled", 
-                 "Train Rescaled")
+               df.pred.train[,3]))
+  names(rmse)<-c("Test", 
+                 "Train")
   
 return(list(
   'df.pred'=data.frame(rbind(df.pred.test, 
@@ -514,7 +557,7 @@ lasso.l<-lapply(1:n.out,
                 FUN=lasso.f)
 ```
 
-## Finding Non-Zero Features
+## Finding non-zero Features
 
 We'll now define a function `find.ft.f` that will take the results of the LASSO regularization and return the non-zero features and their coefficients. `lmd` is defined similarly. 
 
@@ -557,20 +600,21 @@ find.ft.f<-function(i.out,
     # Concatenate as single string
     f.string<-paste(f.string1, collapse="+")
     
-      # further concatenate into formula by adding ddG~
+      # further concatenate into formula by adding lnYield~
       f.string.f<-paste(
-        c("ddG~", f.string), 
+        c("lnYield~", f.string), 
         collapse=""
       )
     
-      # if all features are shrunk, paste ddG~Intercept 
+      # if all features are shrunk, paste lnYield~Intercept 
       if(length(f.string1)==0){
-        f.string.f<-"ddG~Intercept"
+        f.string.f<-"lnYield~Intercept"
       }
     
   return(list(
     "features"=df.coef, 
-    "formula"=f.string.f
+    "formula"=f.string.f, 
+    "coef"=df.coef
   )
 )
 }
@@ -584,134 +628,203 @@ lasso.ft.l<-lapply(1:n.out,
                    FUN=find.ft.f)
 ```
 
+Backtransform predicted using Duan's smearing adjustment and measured rmse: 
+
+$$y_i=\hat{y}_i+ \varepsilon $$
+$$\hat{y}^*_i=e^{\hat{y}_i} \times \frac{1}{n} \sum_{i=1}^n e^{\varepsilon} $$
+
+```{r backtransform}
+bt.f<-function(i.out, lasso_list=lasso.l, 
+               mean_list=tv.mean.l, scale_list=tv.sd.l, 
+               output="lnYield"){
+  # Call prediction and scalign attributes
+  x<-lasso_list[[i.out]]$df.pred
+  x.mean<-mean_list[[i.out]][output]
+  x.sd<-scale_list[[i.out]][output]
+  
+  # Rescale predictions 
+  x.pred.rs<-x$Predicted.Transformed*x.sd+x.mean
+  x.meas.rs<-x$Measured.Transformed*x.sd+x.mean
+  
+  # Define number of test and length of entire df
+  n.ts<-nrow(x[x$Set=="Test",])
+  n<-nrow(x)
+  
+  # Find two residuals: test and tv 
+  res.ts<-(x.meas.rs-x.pred.rs)[1:n.ts]
+  res.tv<-(x.meas.rs-x.pred.rs)[(n.ts+1):n]
+  
+  # raise e to measured lnYield to return to yield space 
+  x.meas.bt<-exp(x.meas.rs)
+  
+  # duan's smearing adjustment 
+  x.pred.bt<-c(exp(x.pred.rs[1:n.ts])*mean(exp(res.ts)),
+               exp(x.pred.rs[(n.ts+1):n])*mean(exp(res.tv))
+  )
+  
+  # Create 
+  lasso_list[[i.out]]$df.pred$"BT.Measured"<-x.meas.bt
+  lasso_list[[i.out]]$df.pred$"BT.Predicted"<-x.pred.bt
+  
+ return(lasso_list[[i.out]])
+}
+
+bt.pred.l<-lapply(1:n.out, FUN=bt.f)
+```
+
+We'll now find back-transformed RMSEs. 
+
+```{r}
+rmse.bt.f<-function(i.out, bt_list=bt.pred.l){
+  # Call df 
+  x<-bt_list[[i.out]]$df.pred
+  
+  # Split into test adn tv 
+  tv<-x[x$Set=="Train",]
+  ts<-x[x$Set=="Test",]
+ 
+  # Find RMSE 
+  tv.rmse<-sqrt(mean((tv$BT.Measured-tv$BT.Predicted)^2))
+  ts.rmse<-sqrt(mean((ts$BT.Measured-ts$BT.Predicted)^2))
+  
+  # Concatenate into vector 
+  return(c(i.out, tv.rmse, ts.rmse))
+}
+
+
+# Apply across all outer folds
+
+df.bt.rmse<-as.data.frame(t(sapply(1:n.out, rmse.bt.f)))
+  colnames(df.bt.rmse)<-c("i.out", 
+                          "BT.TV.RMSE", 
+                          "BT.Test.RMSE")
+```
+
 ## Summarizing Features 
 
-We have our LASSO predicted vs measured dfs for both tv/test data, the RMSEs for both tv/test data, and the regularized features after LASSO has shrunk some of our parameters to zero. We can start with a tally of which features were preserved and the test/tv rmses. 
+We have our LASSO predicted vs measured dfs for both tv/test data, the RMSEs for both tv/test data, and the regularized features after LASSO has shrunk some of our parameters to zero. We can start with a tally of which features were preserved and the test/tv rmses.
 
-As always, let's make a function for this. We'll call it `summ.lasso.f`. 
+Before we do this, we'll create a for loop that will extract $\lambda$s. 
+
+```{r lambda}
+# create empty matrix to store lambdas
+lmd<-matrix(nrow=n.out, ncol=2)
+
+# for loop to find lambda 
+  for(i in 1:n.out){
+    lmd[i,]<-c(lasso.l[[i]]$lasso.fit$lambda.1se, 
+               lasso.l[[i]]$lasso.fit$lambda.min)
+  }
+
+# convert to data frame 
+lmd<-as.data.frame(lmd)
+
+  # alter column name 
+  colnames(lmd)<-c("lmd.1se", "lmd.min")
+```
+
+Let'summarize our LASSO results with the function `summ.lasso.f`. 
 
 ```{r summ_lasso_f}
 summ.lasso.f<-function(i.out, 
-                       lasso_output_list=lasso.l, 
                        lasso_ft_list=lasso.ft.l){
-  # call output
-    out<-lasso_output_list[[i.out]]
-    
-    # Call rmse 
-      rmse<-out$rmse 
     
   # call features
     ft<-lasso_ft_list[[i.out]]
     
       # Call formula 
       form<-ft$formula 
-    
-  # Make a data frame row 
-  
-    df<-data.frame(
-      "TV-Test Split"=i.out, 
-      "Features"=form, 
-      "Rescaled Train RMSE"=rmse[4],
-      "Rescaled Test RMSE"=rmse[3]
-    )
-      # Remove any row names
-    rownames(df)<-c()
-    
-  return(df)
+  return(form)
 }
 ```
 
 We'll use `sapply()` to apply this function over all tv-test splits to return a dataframe.
 
+
 ```{r apply_summ_lasso_f}
-# find lambda 1se
-lmd<-rep(n.out)
-  
-  for(i in 1:n.out){
-  lmd[i]<- eval(parse(text=paste('lasso.l[[i]]$lasso.fit$', lambda, 
-                                       sep="")))
-}
-
 # create df as mentioned above
-df.lasso<-data.frame(t(sapply(1:n.out, 
-       summ.lasso.f)), 
-       lmd)
-  
-
-  # use unlist.f
-  df.lasso<-unlist.f(df.lasso)
+df.lasso<-data.frame(Features=(sapply(1:n.out, 
+       summ.lasso.f)
+  ), 
+  df.bt.rmse, 
+  lmd
+) 
 
     # melt for ggplot 
-    df.lasso.summ.m<-melt(df.lasso, 
+    df.lasso.m<-melt(df.lasso, 
                           id.vars=c('Features', 
-                                    'TV.Test.Split')
+                                    'i.out', 'lmd.1se', 
+                                    'lmd.min')
     )
-      colnames(df.lasso.summ.m)[3]<-"RMSE"
+      colnames(df.lasso.m)[5]<-"Back_Transformed_RMSE"
+      
+      # Features as factor
+      df.lasso.m$Features<-as.factor(df.lasso.m$Features)
+      
+      # or plotting ease, replace models with numbers 
+      levels(df.lasso.m$Features)<-1:length(levels(df.lasso.m$Features))
+
 ```
 
+Plot the distribution of TV and test RMSEs. 
 
 ```{r visualizing_lasso, fig.height=10, fig.width=7.5}
 # Make boxplot of test and training RMSE 
 # for each model
-ggplot(df.lasso.summ.m, 
-       aes(x=Features, 
-           color=RMSE)
+ggplot(df.lasso.m, 
+       aes(x=Features, y=value,
+           color=Back_Transformed_RMSE)
        )+ 
   geom_boxplot(aes(y=value)) + 
   geom_text(stat="count",
             aes(label=..count..), 
             y=0) + 
-  facet_grid(rows=vars(RMSE)) + 
-  theme(axis.text.x = element_text(angle=-45, 
+  facet_grid(rows=vars(Back_Transformed_RMSE), 
+             scales='free') + 
+  theme(axis.text.y = element_text(angle=45, 
                                    hjust=0,
                                    vjust=1)) + 
-  ylab("RMSE") + 
-  ylim(0, max(df.lasso.summ.m$value)
+  ylab("Back-Transformed RMSE") + 
+  ylim(0, max(df.lasso.m$value)
   ) + 
   ggtitle(paste(
-    c("LASSO Test and Training RMSE,", coordination),
+    c("LASSO Test and Training RMSE,", epx),
     collapse=" "
-  ))
+  )) + 
+  coord_flip()
 ```
 
-`df.lasso` can be summarized by examining average performance metrics and frequency of each unique feature set: 
 
+Concatenate `df.lasso` to display counts average performance metrics. 
 ```{r lasso_averages}
 # use tapply() to calculate average tv/test RMSE as well as table()
   # the counts of each model
   
 df.lasso.avg<-data.frame(
   "Model"=levels(as.factor(df.lasso$Features)), 
-  "Avg Train RMSE"=as.numeric(
-    tapply(df.lasso$Rescaled.Train.RMSE, 
+  "Avg BT Train RMSE"=as.numeric(
+    tapply(df.lasso$BT.TV.RMSE, 
                            df.lasso$Features,
                            mean)
                            ),
   "Avg Test RMSE"=as.numeric(
-    tapply(df.lasso$Rescaled.Test.RMSE, 
+    tapply(df.lasso$BT.Test.RMSE, 
                            df.lasso$Features,
                            mean)),
-  lambda= as.numeric(
-    tapply(df.lasso$lmd, 
-                           df.lasso$Features,
-                           mean)),
+  
+  "Avg lmd.1se"=as.numeric(
+    tapply(df.lasso$lmd.1se, df.lasso$Features, mean)
+  ),
+  
   "Count"=as.numeric(
     table(df.lasso$Features)
   )
 )
-
-# Reorder in decreasing frequnecy 
-df.lasso.avg<-df.lasso.avg[
-  order(-df.lasso.avg$Count),
-]
 
 # display 
 kable(
   df.lasso.avg[order(
   df.lasso.avg$Count, decreasing=T
 ),])
-
-
-coef(lasso.l[[6]]$lasso.fit)
 ```
 

@@ -1,0 +1,1007 @@
+---
+title: "PARC Epoxide: Repeated Stratified Nested Cross-Validation"
+author: "Lucy Wang"
+date: "12/24/2020"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(knitr)
+library(reshape2)
+library(leaps)
+library(caret)
+library(gridExtra)
+
+
+
+knitr::opts_chunk$set(fig.width = 8, message=F, 
+                      echo=T, tidy.opts=list(width.cutoff=60), 
+                      tidy=T)
+
+
+setwd("/Users/lucywang/Google Drive/Doyle Lab/PARC 2/PARC Modeling")
+```
+
+# Preprocessing 
+
+## Reading in Data 
+
+Read in df, Define function `prep.f` that will preprocess the data, returning the processed dataframe 
+
+`prep.f` takes the following arguments 
+* `data`: the raw dataframe 
+* `output`: a character string of output; here, we're interested in Yield, but can also change to another output like $\Delta \Delta G ^ {‡}$
+* `transform`: a logical argument; if `transform=T`, applies log transformation on output 
+
+
+```{r read_in}
+df0<-na.omit(read.csv("Parc Ni Cyc.csv"))
+  epx="Cyclic Epoxides"
+
+prep.f<-function(data, 
+                 output="Yield", transform=F){
+#change η to dent for convenience 
+colnames(data)[which(colnames(data)=="η")]<-"dent"
+
+#Class and denticity as factor variable
+data$Class<-as.factor(data$Class)
+data$dent<-as.factor(data$dent)
+
+# ID as character variable
+data$ID<-as.character(data$ID)
+
+#Delete ddG output and denticity
+
+ifelse(output=="Yield", 
+       data<-data[,-c(
+  grep("ddG", colnames(data)), 
+  grep("dent", colnames(data))
+)], 
+data<-data[,-c(
+  grep("dent", colnames(data)), 
+  grep("Yield", colnames(data))
+)])
+
+# Transform
+
+if(transform==T){
+  data[,grep(output, colnames(data))]<-log(data[,grep(output, colnames(data))])
+  
+  # rename column
+  colnames(data)[grep(output, colnames(data))]<-paste(c("ln", output), 
+                                                                 collapse="")
+}
+
+return(data)
+}
+
+# Process data 
+df<-prep.f(df0, transform=T)
+
+# Define output as character string 
+dv<-colnames(df)[3]
+```
+
+### Vbur factor
+
+Uncomment to append the binary categorical variable `Vbur<37` to the dataframe for modeling.  
+
+```{r}
+#vbur.fac<-rep(nrow(df))
+
+#for(i in 1:nrow(df)){
+ # ifelse(df[,grep("VBur", colnames(df))][i]<37, 
+  #       vbur.fac[i]<-T,
+   #      vbur.fac[i]<-F)
+#}
+
+#df<-data.frame(df, vbur.fac)
+```
+
+
+# The Outer Loop: Training-Validation and Test Split 
+
+A repeated 4-fold (75-25) cross-validation, stratified split by ligand class (BiIM, non-benzyl BiOx, and benzyl BiOx) is conducted using `createMultiFolds` from the `caret` package. This 4-fold partition will be repeated 5 times. 
+
+75% of the data will be the training-validation (tv) set, which will be used to select features for the multivariate linear regression model. The remaining 25% of the data will be our test set, which we will NOT subject to cross-validation or training; this set will be used once we've adequately trained our model with the training-validation set. 
+
+We will also define some important variables: 
+* `k.out`: number of folds to create for the outer loop (here, `k.out`=4)
+* `l.out`: number of repeats to create for the outer loop (here, `l.out`=5)
+* `n.out`: $k.out*l.out$, the totaly number of folds in the outer loop (here, `n.out`=20)
+
+```{r outer_var}
+k.out<-4
+l.out<-5
+n.out<-k.out*l.out
+```
+
+We will proceed with the splitting for the outer loop. `createMultiFolds()` outputs a list of indices for the training-validation set. 
+
+* `fold_idx`: the list of indices that determine each fold 
+* `df0`: the dataframe for splitting 
+
+```{r outer_split}
+# Set seed 
+set.seed(1997, sample.kind="Rejection")
+
+# Create outer repeated cv fold index
+out_fold_idx<-createMultiFolds(df$Class, k=k.out, times=l.out)
+
+# Write function that will take the indices of folds and split them 
+# According to the indices in out_fold_idx
+# if the argument tv=T, function will return training-validation folds 
+# else, test folds
+
+split.out.f<-function(i.out, df0=df, fold_idx=out_fold_idx, tv=TRUE){
+  if(tv==TRUE){
+  # return tv set 
+  return(df0[fold_idx[[i.out]],]
+  )
+    }
+  
+# Otherwise, 
+ # print test set 
+ return(df0[-fold_idx[[i.out]],]
+        )
+}
+
+```
+
+For $i.out$ in $1,2,...,n.out$, we will use `split.out.f` to create the training-validation and test sets. We do this using `lapply()`, thus creating a list of `n.out` training-validation sets and a similar list of test sets. 
+```{r outer_split_save}
+
+  # TV
+  tv.l<-lapply(1:n.out, 
+       FUN=split.out.f, 
+       tv=T)
+
+  # Test
+  ts.l<-lapply(1:(k.out*l.out), 
+       FUN=split.out.f, 
+       tv=F)
+```
+
+remove L29
+```{r}
+#for(i in 1:n.out){
+ # ts.l[[i]]<-ts.l[[i]][ts.l[[i]]$ID!=31&ts.l[[i]]$ID!=33
+  #                     ,]
+#}
+```
+
+
+Note that `tv.l[[i.out]]` $\cup$ `ts.l[[i]]` yields `df`. 
+
+We'll move on with feature scaling. 
+
+##  Feature Scaling 
+
+The values of each numerical feature will be standardized into a Z-score determined by the feature's mean and standard deviation. Only tv sets will be passed through the following function `scale.f`, which operates on only a single tv set.   
+
+* `i.out`: defined above 
+* `tv_list`: list of tv sets to pass through the function 
+* `center`, `scale`, and `dfs` are logical argument; only one can be set to `TRUE` for a given call. 
+    + `center`: outputs a list of feature means
+    + `scale`: outputs a list of feature standard deviations
+    + `dfs`: outputs the scaled features 
+    
+It's important to save `the means and standard deviations of the tv sets as they will be used later to scale the test features. 
+    
+
+```{r scale_f}
+
+scale.f<-function(i.out, tv_list,
+                  center=FALSE, 
+                  scale=FALSE, 
+                  dfs=FALSE
+                  ){
+  
+  # define x to be ith data frame in list 
+  x<-tv_list[[i.out]]
+  
+  # Because scale() only takes numerical data, 
+  #remove non-numerical feature Ligand class and ID
+  #and call the resulting numerical data frame x.num
+  
+  x.num<-x[,-c(
+  grep("Class", colnames(x)), 
+  grep("ID", colnames(x))
+)]
+  
+  # Define character vector of column names 
+  x.num.colnames<-colnames(x.num)
+  
+  # Scale and center 
+  x.sc0<-scale(x.num)
+  
+    # Save mean 
+    if(center==TRUE){
+      return(attr(x.sc0, "scaled:center"))
+    }
+
+    # Save sd
+    if(scale==TRUE){
+      return(attr(x.sc0, "scaled:scale"))
+    }
+  
+    # Save scaled tv matrix 
+    
+    if(dfs==TRUE){
+      # Convert to data frame
+      x.sc0<-as.data.frame(x.sc0)
+      
+      # add back colnames 
+      colnames(x.sc0)<-x.num.colnames
+      
+      # add back ID and ligand class
+      x.sc<-data.frame(ID=x$ID, 
+                      x.sc0, 
+                     Class=x$Class)
+      # save 
+      return(x.sc)
+    }
+}
+
+```
+
+Pass all `n.out` tv sets through `scale.f()` and save in list. Also save the means and standard deviations used for scaling. 
+```{r scale_save}
+# Concatenate scaled tv dfs 
+tv.sc.l<-lapply(1:n.out, 
+                FUN=scale.f, 
+                tv_list=tv.l, 
+                dfs=T)
+                
+# Concatenate feature means for each tv set 
+tv.mean.l<-lapply(1:n.out, 
+                FUN=scale.f, 
+                tv_list=tv.l, 
+                center=T)
+
+# Concatenate feature sd for each tv set 
+tv.sd.l<-lapply(1:n.out, 
+                FUN=scale.f, 
+                tv_list=tv.l, 
+                scale=T)
+```
+
+
+We will now continue on with feature selection. 
+
+# The Inner Loop: Feature Selection 
+
+## Protocol Overview 
+The protocol is thus: 
+
+1. The $i_{out}^{th}$ training-validation validtion will be subjected to a $k_{in}$-fold (here, 5) cross validation, repeated $l_{in}=10$ times, generating $k_{in}*l_{in}$ (here, 50) validation sets. 
+2. Each $k_{in}^{th}$ fold of the $l_{in}^{th}$ repeat will serve as the validation set, and the remaining $k_{in}-1$ folds of the $l_{in}^{th}$ repeat will be used to train a $q$-feature multivariate linear model (OLS). The model that yields the lowest validation RMSE will be recorded. 
+3. After $k_{in}*l_{in}$ instances, there will fifty $q$-parameter (here, $q=1$) models. The model that occurs the most will be selected to train on the entire test-validation set to generate coefficients, RMSE, adjusted $R^2$, and other metrics. 
+4. This final model will be used to conduct predictions on the test set. 
+
+```{r in_var}
+k.in<-5
+l.in<-10
+n.in<-k.in*l.in
+```
+
+## Helper Functions
+
+We'll also define some helper functions. 
+
+`get_model_formula()` will access the formula of models returned by `regsubsets()`, a function in the `leaps` package that will do exhaustive subset selection for feature selection. It takes the following arguments: 
+* `id`: which row of the `regsubsets` output to access
+    + `regsubsets()` outputs the feature results starting with 1-feature models, however many are specified by the argument `nbest`, all the way to `nvmax`. Accordingly, `regsubsets()` will return `nvmax*nbest` results. 
+    + We are interested in looking at a $q$-parameter model, so it makes sense to examine the rows $(q-1)*nbest+1$ to $q*nbest
+* `object`: output of `regsubsets()`
+* `dv`: a character string of the dependent variable (here, `dv`="Yield)
+
+```{r get_model_formula}
+get_model_formula<-function(id, object,dv="lnYield") {
+      #save logical matrix of features from regsubsets() and subset the id of interest 
+      # -1 removes intercept column
+       models<-summary(object)$which[id,-1]
+      # Preserve only the features that are used 
+      predictors<-names(which(models==T))
+        # Concatenate features into a string separated by + 
+        predictors<-paste(predictors, collapse="+")
+      # Concatenate features with ~ and outcome into character string 
+      full<-paste0(dv, "~", predictors)
+      }
+```
+
+Another helper function that will be used is `get_cv_rmse()`, which will use the formula outputted by `get_model_formula()` to train on the training set and predict validation set RMSE. 
+
+* `formula_string`: output of `get_model_formula()`, a character vector 
+* `train_set`: training set 
+* `val_set`: validation set containing measured output values 
+* `mean_list`: list of scaled means
+* `sd_list`: list of scaled standard deviations
+    + Yield RMSEs should be evaluated with the unscaled Yield (not the sacled z-score)
+    + `i.out` refers to the $i^{th}$ training-validation and test set split of the outer loop
+* `dv`: dependent variable, a character vector
+
+```{r get_cv_rmse_f}
+# Create function that will use formula to predict validation set and calculate rmse 
+
+get_cv_rmse<-function(formula_string, train_set, val_set, 
+                      mean_list=tv.mean.l, sd_list=tv.sd.l, dv="lnYield", 
+                      i.out){
+  # define measured validation Yield as vector 
+  val.meas<-val_set[, 
+               which(colnames(val_set)==dv)]
+  
+  #convert string to formula
+  formula<-as.formula(formula_string)
+  
+  # create model lm() for prediction
+  object<-lm(formula, data=train_set)
+  
+  # predict validation Yield (scaled) given inputs of validation
+  pd_cv<-predict(object, newdata=val_set)
+  
+  # find mean and sd Yield for scaling 
+  mean.Yield<-mean_list[[i.out]][dv]
+  sd.Yield<-sd_list[[i.out]][dv]
+  
+    # convert scaled Yield to original 
+    pd_cv<-pd_cv*sd.Yield+mean.Yield
+    
+    # scale back Yield of validation set 
+    val_usc<-val.meas*sd.Yield+mean.Yield
+  
+  # calculate RMSE 
+  rmse_cv<-sqrt(mean((pd_cv-val_usc)^2))
+  
+  return(rmse_cv)}
+
+
+
+```
+
+## Executing CV Feature Seletion with `regsubsets()`
+
+Execute repeated cross validation on the training-validation (tv) set. For each tv set,there are $n_{in}=k_{in}\times l_{in}$ training sets and an equal number of validation sets. 
+
+`cv.ftsel.f()` is a function that will execute the repeated cross validation and output the $q$-feature model with the lowest validation RMSE for each training instance. 
+
+* `i.in`: index of a given training and validation set split; $i_{in}=1, 2, ..., n_{in}$
+* `tv`: tv set
+* `l.in`: number of repeats to perform 
+* `k.in`: number of folds to create for each repeat; note that folds within the same repeat do not overlap. 
+* `h`: the number of best models (`nbest` argument in `regsubsets()`) to try for each training set 
+    + From the `h` best models, the model with the lowest validation RMSE will be selected as the "champion" model for the fold
+    + Best, as defined by `regsubsets()` is determined by RSS (residual square sums) of a given model in fitting the training set; it can be seen as a measure of bias 
+* `seed`: a whole number to set the random number generator used by `createMultiFolds()`
+* `fold.var` is a factor variable used as an input of `createMultiFolds()`
+* `q`: number of parameters; here, since $n=40$, $q=1$
+
+
+```{r cv_function, warning=F}
+
+cv.ftsel.f<-function(i.in, tv, 
+                     k.in=5, l.in=10, h=5, 
+                     seed=1998, fold.var="Class", q=1, i.out){
+  # Set seed
+  set.seed(seed, sample.kind="Rejection")
+  
+  # Stored repeated cv indices in previously created list 
+  folds.idx<-createMultiFolds(tv[,which(colnames(tv)==fold.var)], 
+                             k.in, times=l.in)
+  # Call fold by index above 
+    fold_i<-folds.idx[[i.in]]
+    
+  # Subset training set 
+    train<-tv[fold_i,]
+    
+   # Subset validation set 
+    val<-tv[-fold_i,]
+  
+    # Subset selection of training set 
+    # Remove labelers Class and ID 
+    fmod<-regsubsets(lnYield~., data=train[,-c(
+      grep("ID", colnames(train)), 
+      grep("Class", colnames(train))
+    )], really.big=T,nvmax=q, 
+    nbest=h, method="exhaustive")
+    
+     # RMSE of the h best q-feature models output by regsubsets()
+      # Concatenate the h best q-feature model 
+      #and extract model formula as character string 
+      bestq.h<-sapply(((q-1)*h+1):(q*h), FUN=get_model_formula, object=fmod)
+      
+      # For each of the formulas, find RMSE of validation set 
+        # sd and mean lists have already been defined
+      bestq.h.rmse<-sapply(bestq.h[1:length(bestq.h)], FUN=get_cv_rmse, 
+                           train_set=train, val_set=val, i.out=i.out)
+      
+       # concatenate into df 
+      df.bestq.h<-data.frame("Model"=bestq.h, 
+                        "Val.RMSE"=bestq.h.rmse)
+        # remove row names 
+        rownames(df.bestq.h)<-c()
+        
+      # Subset the row with the lowest validation rmse 
+      df.bestq<-df.bestq.h[which(df.bestq.h$Val.RMSE==min(df.bestq.h$Val.RMSE)),]
+      
+      # Print this row 
+      return(df.bestq)
+}
+```
+
+We'll now use the above function within a larger function. 
+
+## Nested CV 
+
+`nested.cv.f()` takes a given tv set and and using `cv.ftsel.f()`, outputs two data frames: 
+
+1. `features`: The output of passing the tv set through `cv.ftsel.f()` across all $n_{in}$ inner folds.Each row is the best $q$-feature model (i.e. lowest validation RMSE) for the $i_{in}^{th}$ inner fold. 
+2. `features.summary`: A summary of `features`, showing the frequency of each unique model and its average validation RMSE. 
+    + $\sum{Frequency}=n_{in}$ (Here, the sum of the frequencies is $n_{in}=k_{in} \times l_{in}=50$)
+    + This table is sorted by decreasing frequencies; if there are ties in frequency, secondary sort by increasing average validation RMSE. 
+    
+
+```{r nested_cv}
+nested.cv.f<-function(i.out, 
+                      k.in=5, l.in=10, h.in=5, 
+                      seed.in=1998, q=1){
+  # call tv set from list 
+  tv.i<-tv.sc.l[[i.out]]
+  
+  # pass this scaled tv set through cv.ftsel.f
+  features.i<-t((sapply(1:n.in, FUN=cv.ftsel.f, 
+       k.in=k.in, l.in=l.in, h=h.in, 
+       seed=seed.in, q=q,
+       tv=tv.i, i.out=i.out)))
+  
+  # convert sapply() output array to dataframe
+  features.i<-data.frame(features.i)
+  
+    # both columns are currently lists, which needs to be converted to 
+    # respective classes
+      features.i$Model<-as.factor(unlist(features.i$Model))
+      features.i$Val.RMSE<-as.numeric(unlist(features.i$Val.RMSE))
+      
+  # concatenate into a df that lists the number of votes each 
+  # model receives along with its average RMSE 
+          
+  features.summary<-merge(
+    #frequency that the model is recommended as best
+    data.frame(table(features.i$Model)), 
+            # Avg. validation rmse of given model
+        data.frame("Avg Val RMSE"=tapply(features.i$Val.RMSE, INDEX=features.i$Model, 
+       FUN=mean)), 
+       by.x="Var1", 
+       by.y=0)
+
+  # Rename Var1 as Model 
+  colnames(features.summary)[1]<-"Model"
+
+  # Sort by descending counts 
+  features.summary<-features.summary[
+    order(-features.summary$Freq, 
+          features.summary$Avg.Val.RMSE),
+    ]
+
+return( list(
+  "features"=features.i, 
+  "features.summary"=features.summary)
+)
+  
+}
+
+```
+
+### Applying `nested.cv.f` Over Training-validation Set 
+
+`nested.cv.f` will be applied across all training-validation sets to generate a list of length $n_{out}$.
+
+```{r apply_nested_fun, warning=F}
+# Pass nested.cv.f through all values of i.out 
+
+ft.l<-lapply(1:n.out, 
+              FUN=nested.cv.f, q=1)
+
+# Example: first tv set 
+kable(ft.l[[1]])
+```
+
+
+### Selecting TV-Specific Champion Model 
+
+For each tv set, the "best" model can be considered as the model appearing with the highest frequency.
+
+`feature_list`: list of feature summaries, i.e. `ft.l`
+
+```{r best_model_sel}
+best.modsel.f<-function(i.out,feature_list=ft.l){
+  
+  # call summary table by i.out of appropriate tv set
+  f<-feature_list[[i.out]]$features.summary
+
+  # convert model to character for sapply() later
+  f$Model<-as.character(f$Model)
+  
+  # Because of how features.summary is sorted, the 
+  # first row is considered the best model 
+  return(f[1,])
+  
+    }
+
+```
+    
+Apply `best.modsel.f()` over all the `n.out` tv folds. 
+
+```{r best_model_sel_apply}
+df.best.mod<-data.frame("i.out"=1:n.out,
+    t(sapply(1:n.out, FUN=best.modsel.f, 
+           ft.l)))
+
+# The columns of df.best.mod are lists, which need to be 
+# Converted into character or numerical vectors. 
+
+for(i in 1:ncol(df.best.mod)){
+  df.best.mod[,i]<-unlist(df.best.mod[,i])
+}
+
+# Revert model to factor variable 
+df.best.mod$Model<-as.factor(df.best.mod$Model)
+
+# Display best mod
+kable(df.best.mod)
+```
+
+`df.best.mod` can be visualized.
+
+The boxplot shows the distribution of each model's average validation RMSEs (i.e. calculated from validation RMSEs of the $n_{in}$ folds) across the $n_{out}$ tv sets. Number to the right of each boxplot is the frequency (out of $n_{out}$)
+
+```{r best_mod_vis}
+# Boxplot of Average Validation RMSEs
+ggplot(df.best.mod, aes(x=Model, y=Avg.Val.RMSE, 
+                        color=Model)) + 
+  geom_boxplot() + 
+  theme(legend.position="none") + 
+  ylab("Average Validation RMSE")+ 
+  ggtitle(paste(c("Average Validation RMSE of Best 
+Models Across TV/Test (Outer) Splits,", 
+                  epx), collapse=" ")) + 
+  geom_label(stat="count", 
+            aes(label=..count..), 
+            y=max(df.best.mod$Avg.Val.RMSE)+
+              0.02) +
+  ylim(min(df.best.mod$Avg.Val.RMSE), 
+       max(df.best.mod$Avg.Val.RMSE)+0.05) +
+  coord_flip()
+  
+```
+
+# Training the Models
+
+Define the function `train.f()` that will take a character vector of $n_{out}$ formulas and train them on the corresponding scaled tv set (`scaled_tvlist()`), returning a list of $n_{out}$ `lm()` objects for future prediction. 
+
+```{r train_f}
+train.f<-function(i.out, formula_vector, 
+                  scaled_tvlist){
+  #Subset ith formula 
+  formula.i<-formula(formula_vector[i.out])
+  
+  # Subset ith tv set, which should be scaled
+  tv<-scaled_tvlist[[i.out]]
+  
+  # Run lm()
+  model<-lm(formula.i, 
+            tv)
+  
+  return(model)
+}
+```
+
+Apply `train.f()` across $n_{out}$ tv sets to create list of `lm()` objects. 
+
+```{r train}
+# Freq trained mods 
+trmods.l<-lapply(
+  1:n.out, 
+  FUN=train.f, 
+  formula_vector=as.character(df.best.mod$Model), 
+  scaled_tvlist=tv.sc.l
+)
+```
+
+`adjr2.f()` is a function that will output the adjusted $R^2$ from each of the trained models. 
+
+```{r adjr2_f}
+adjr2.f<-function(i.out, trainedmods_list=trmods.l){
+  # Subset out model 
+  mod<-trainedmods_list[[i.out]]
+  
+  # find adjr2
+  return(
+    summary(mod)$adj.r.squared)
+}
+```
+
+Apply `adjr2.f()` across $n_{out}$ tv sets. 
+
+```{r adjr2f_apply}
+# Create df to show adr2
+df.adjr2<-data.frame(
+  "i.out"=1:n.out,
+  "Model"=as.factor(df.best.mod$Model), 
+  "adjr2"=sapply(1:n.out, FUN=adjr2.f)
+)
+
+# Summary table 
+df.adjr2.summary<-data.frame(
+  "Model"=levels(df.best.mod$Model),
+  "Average AdjR2"=
+  tapply(df.adjr2$adjr2, 
+         df.adjr2$Model, 
+         mean)
+      )
+  # Remove row names 
+  rownames(df.adjr2.summary)<-c()
+
+  
+# Show summary 
+kable(
+  df.adjr2.summary[order(df.adjr2.summary$Average.AdjR2, 
+                         decreasing=T),]
+)
+
+```
+
+Visualize distribution of Adusted $R^2$ using boxplot. Number to the right of each boxplot is the frequency (out of $n_{out}$)
+
+```{r adjr2_vis}
+# Visualize 
+ggplot(df.adjr2, 
+       aes(x=Model, 
+           color=Model)) + 
+  geom_boxplot(aes(
+    y=adjr2
+  )) + 
+  theme(legend.position = "none")+
+  ggtitle(paste(
+    c("Distribution of Adjusted R2 of Each Model, by Method,", epx), collapse=" ")
+  ) +
+  geom_label(stat="count", 
+            aes(label=..count..), 
+            y=max(df.adjr2$adjr2)+0.02) + 
+  ylim(min(df.adjr2$adjr2), 
+       max(df.adjr2$adjr2)+0.05) + 
+  coord_flip()
+```
+
+
+# Testing the Models 
+
+## Scaling the Test Set 
+
+`scale.ts.f()` scales each test set according to the scaling attributes (mean, standard deviation) of the corresponding tv set. 
+
+* `test_list`: the list of unscaled test sets
+* `center_list`: the list of means
+* `scale_list`: the list of standard deviations
+
+```{r scale_ts_f}
+scale.ts.f<-function(i.out, 
+                     test_list=ts.l, 
+                     center_list=tv.mean.l,
+                     scale_list=tv.sd.l){
+  # Call test set 
+  test<-test_list[[i.out]]
+  
+  # Remove ID, Class 
+  test.num<-test[,-c(
+    grep("ID", colnames(test)), 
+    grep("Class", colnames(test))
+  )]
+  
+  # Call center from list 
+  center.i<-center_list[[i.out]]
+
+  # Call scale from lsit 
+  scale.i<-scale_list[[i.out]]
+  
+  # scale test.num
+  test.sc0<-scale(test.num, 
+                  center=center.i, 
+                  scale=scale.i)
+  
+  # convert to df, add back ID and Class
+  test.sc<-data.frame(
+    "ID"=test$ID, 
+    as.data.frame(test.sc0), 
+    "Class"=test$Class
+  )
+  
+  # return 
+  return(test.sc)
+}
+
+#Apply function over all test sets  
+ts.sc.l<-lapply(1:n.out, 
+       FUN=scale.ts.f)
+```
+
+
+## Predictions 
+
+Define the function `predict.f` that, for a given tv/test (outer) split, will predict the ΔΔG^‡^ of the training-test set as well as the test set (values stored as a vector). The function will then rescale these predicted values and make a dataframe displaying predictions against measured Yields. 
+
+* `trained_mods_list`: list of `lm()` objects; length $n_{out}$
+* `dv`: a string of the dependent variable 
+
+Output data frame: 
+* `Predicted`: predicted ΔΔG^‡^;unscaled 
+* `Measured`: measured ΔΔG^‡^; unscaled 
+* `Set`: factor variable of either Training-Validation or test 
+* `ID`: ligand ID 
+
+```{r predict_f}
+predict.f<-function(i.out, trained_mods_list=trmods.l, 
+                    scaled_tv_list=tv.sc.l,scaled_test_list=ts.sc.l, 
+                    unscaled_tv_list=tv.l, unscaled_test_list=ts.l,
+                    center_list=tv.mean.l, scale_list=tv.sd.l, dv="lnYield"){
+  # Call ith model 
+  mod<-trained_mods_list[[i.out]]
+  
+  # Call ith scaled tv set 
+  tv.sc<-scaled_tv_list[[i.out]]
+  
+  # Call ith scaled test set 
+  test.sc<-scaled_test_list[[i.out]]
+  
+  # Call mean Yield value of ith tv set 
+  center.i<-center_list[[i.out]][dv]
+  
+  # Pull sd Yield value of ith tv set 
+  scale.i<-scale_list[[i.out]][dv]
+  
+  # Predict tv Yield 
+  pred.tv.sc<-predict(mod, 
+                      newdata=tv.sc)
+  
+  # Predict test Yield 
+  pred.ts.sc<-predict(mod, 
+                      newdata=test.sc)
+  
+  # Rescale tv Yield predictions 
+  pred.tv<-pred.tv.sc*scale.i+center.i
+
+  # Rescale tv Yield predictions 
+  pred.ts<-pred.ts.sc*scale.i+center.i
+
+  # Concatenate into df 
+  df.pred<-data.frame(
+    "ID"=c(tv.sc$ID, 
+           test.sc$ID),
+    'Predicted'=c(pred.tv, 
+                  pred.ts),
+    'Measured'=c(unscaled_tv_list[[i.out]][, 
+                                           which(colnames(unscaled_tv_list[[i.out]])
+                                                 ==dv)], 
+                 unscaled_test_list[[i.out]][, 
+                                           which(colnames(unscaled_test_list[[i.out]])
+                                                 ==dv)]), 
+    "Set"=c(
+      rep("Training-Validation", length(pred.tv)),
+      rep("Test", length(pred.ts),)
+    )
+  )
+  
+  return(df.pred)
+                    }
+  
+```
+
+Apply `predict.f()` to all $n_{out}$ tv and test sets, outputting a list of $n_{out}$ data frames.  
+
+```{r apply_pred_f}
+pred.l<-lapply(1:n.out, 
+                    FUN=predict.f)
+```
+
+
+### Finding RMSE 
+Define a function `rmse.f` that will find the training-validation and test RMSEs. 
+
+* If `transform=T`, Duan's smearing adjustment will be applied to backtransform the rescaled predictions to native output space:
+
+$$y_i=\hat{y}_i+ \varepsilon $$
+
+$$\hat{y}^*_i=e^{\hat{y}_i} \times \frac{1}{n} \sum_{i=1}^n e^{\varepsilon} $$
+where $y_i$ is the log-transformed measured output, $\hat{y}_i$ is the log-transformed predicted output, $\epsilon$ is the residual error, $\hat{y}^*_i$ is the back-transformed predicted output, and $n$ is the number of predictions. Note that the back-transformed measured output $y^*_i$ is simply $e^{y_i}$. Also observe that $\frac{1}{n} \sum_{i=1}^n x$ is equal to the mean of $x$. 
+
+```{r rmse_f}
+rmse.f<-function(i.out, pred_list, transform=F){
+  
+  # Call ith predicted/measured df 
+  pred.i<-pred_list[[i.out]]
+  
+  # Subset training/validation RMSE
+    tv<-pred.i[pred.i$Set=="Training-Validation",]
+        # Find tv RMSE 
+        tv.rmse<-sqrt(
+          mean(
+            (tv$Predicted-tv$Measured)^2
+          )
+        )
+        
+    # Subset test RMSE 
+    ts<-pred.i[pred.i$Set=="Test",]
+        # Find test RMSE 
+        ts.rmse<-sqrt(
+          mean(
+            (ts$Predicted-ts$Measured)^2
+          )
+        )
+        
+        
+    # Create df
+      
+      df.rmse<-data.frame(
+        "i.out"=i.out, 
+        "TV RMSE"=tv.rmse,
+        "Test RMSE"=ts.rmse
+      )
+      
+      # Duan's smearing adjustent 
+      if(transform==T){
+        
+        # measured values to yield scale 
+          tv.y<-exp(tv$Measure)
+          ts.y<-exp(ts$Measure)
+          
+        # back transform predicted values with Duan's smear factor 
+          tv.yp<-exp(
+            (tv$Predicted)) * mean(
+              exp(tv$Measured-tv$Predicted) #measured-predicted is the residual
+            )
+          
+          ts.yp<-exp(
+            (ts$Predicted)) * mean(
+              exp(ts$Measured-ts$Predicted)
+            )
+          
+          #save to df.rmse
+          df.rmse$"BT TV RMSE"<-sqrt(mean((tv.y-tv.yp)^2))
+          df.rmse$"BT Test RMSE"<-sqrt(mean((ts.y-ts.yp)^2))
+          }
+      
+      return(df.rmse)
+      
+}
+```
+
+
+Apply this function over the outer folds. 
+
+```{r rmse_f_apply}
+df.rmse<-data.frame(
+"Model"=df.best.mod$Model,
+  t(
+      sapply(1:n.out, 
+         FUN=rmse.f,
+         pred.l, transform=T))
+)
+
+#Unlist each column 
+for(i in 1:ncol(df.rmse)){
+  df.rmse[,i]<-unlist(df.rmse[,i])
+}
+
+kable(df.rmse)
+```
+
+Create summary table showing the frequency of the models across the outer folds and the corresponding average training-validation and test RMSEs. This table will be sorted by descending frequency. If there is a tie in frequency, secondary sort by ascending average test RMSE. 
+
+```{r rmse_f_apply}
+# Find average RMSE for each model
+# Models chosen by popularity 
+df.rmse.summary<-data.frame(
+  Model=levels(
+    as.factor(
+          df.rmse$Model
+  )), 
+  "Average TV RMSE"=as.numeric(tapply(df.rmse$TV.RMSE, 
+       INDEX=df.rmse$Model, 
+       FUN=mean)), 
+  "Average Test RMSE"=as.numeric(tapply(df.rmse$Test.RMSE, 
+       INDEX=df.rmse$Model, 
+       FUN=mean)), 
+   "Average BT TV RMSE"=as.numeric(tapply(df.rmse$BT.TV.RMSE, 
+       INDEX=df.rmse$Model, 
+       FUN=mean)), 
+  "Average BT Test RMSE"=as.numeric(tapply(df.rmse$BT.Test.RMSE, 
+       INDEX=df.rmse$Model, 
+       FUN=mean)), 
+  'Adjusted R2'=as.numeric(tapply(df.adjr2$adjr2, 
+                                  INDEX=df.adjr2$Model, 
+                                  FUN=mean)),
+  "Frequency"=as.numeric(
+    table(df.rmse$Model)
+  )
+)
+
+# Reorder 
+df.rmse.summary<-df.rmse.summary[
+  order(-df.rmse.summary$Frequency, 
+        df.rmse.summary$Average.Test.RMSE), 
+]
+  
+#Display summary table 
+kable(df.rmse.summary)
+```
+
+```{r ggpairs}
+ggpairs(df[,c(
+ grep("Vol.Ni", colnames(df)), 
+  grep("Class", colnames(df)), 
+     grep("lnYield", colnames(df)))
+], title=paste0(epx, ",", dv), 
+mapping=ggplot2::aes(color=Class), alpha=0.4)
+
+```
+
+## Visualizing RMSE
+
+From `df.rmse`, a plot of Test RMSE vs. TV RMSE can be constructed for each tv-test (outer) split. The points will be colored by the combination of features used, and the dashed line represents $y=x$. 
+
+```{r test_vs_tv_rmse_vis}
+# Scatterplot of TV/Test RMSEs, by Model and Method 
+ggplot(df.rmse)+ 
+  geom_point(aes(
+    x=BT.TV.RMSE, 
+    y=BT.Test.RMSE, 
+    color=Model
+  ), 
+  alpha=0.6) + 
+  ggtitle(paste(
+    c("Back-transformed Training-Validation and Test RMSE,", 
+      epx), collapse=" ")
+    )+ 
+  geom_segment(aes(x=0.1, 
+                   y=0.1,
+                  xend=max(TV.RMSE), 
+                   yend=max(TV.RMSE)), 
+               linetype="dashed", 
+               alpha=0.6/n.out)
+```
+
+Subsequently, a box plot of RMSE distributions for each model can be constructed. The facet grids show the tv and test RMSE sets. 
+
+```{r rmse_boxplot}
+# Melt data set into wide format for ggplot
+df.rmse.m<-melt(df.rmse[,-c(3,4)], 
+id.vars=c("i.out", 
+          "Model")
+)
+# Rename column 
+colnames(df.rmse.m)[3]<-"Set"
+
+# PLot
+ggplot(df.rmse.m, 
+        aes(x=Model, 
+        y=value, 
+        color=Model)) + 
+  geom_boxplot() + 
+  facet_grid(rows=vars(Set),
+             scales="free") + 
+  theme(axis.text.x=element_text(angle=-45, 
+                                 hjust=0, 
+                                 vjust=1), 
+        legend.position="none", 
+        plot.margin = unit(c(1,2,0,1), "cm")) + 
+  ylab("RMSE") + 
+  ggtitle(paste0(c("TV and Test RMSE Distributions for Each Model", 
+                   epx), collapse=" "
+  )) 
+```
+

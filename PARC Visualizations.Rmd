@@ -1,0 +1,561 @@
+---
+title: "PARC2: Visualizations"
+author: "Lucy Wang"
+date: "3/7/2021"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(knitr)
+library(reshape2)
+library(xlsx)
+library(clipr)
+library(pheatmap)
+library(gridExtra)
+
+knitr::opts_chunk$set(fig.width = 8, message=F, 
+                      echo=T, tidy.opts=list(width.cutoff=60), 
+                      tidy=T)
+
+
+setwd("/Users/lucywang/Google Drive/Doyle Lab/PARC 2/PARC Modeling")
+```
+
+# Preprocessing 
+
+## Reading in Data 
+
+Read in df. 
+
+```{r read_in}
+#Styrene oxide
+df.s<-na.omit(read.csv("Parc Ni Sty.csv"))
+
+# cyclic 
+df.c<-na.omit(read.csv("Parc Ni Cyc.csv"))
+
+# aliphatic
+df.a<-na.omit(read.csv("Parc Ni Ali.csv"))
+  # remove the row with 0 cc product 
+  df.a<-df.a[df.a$ddG>-10,]
+
+```
+
+Define function `prep.f` that will preprocess the data, returning a list containing the processed dataframe and `epx`, a string designating the epoxide class. 
+
+```{r prep_f}
+prep.f<-function(data, epx="Styrene Oxide"){
+  
+#change η to dent for convenience 
+colnames(data)[which(colnames(data)=="η")]<-"dent"
+
+#L.Class and denticity as factor variable
+data$Class<-as.factor(data$Class)
+data$dent<-as.factor(data$dent)
+
+# remove ddg
+data<-data[,-which(colnames(data)=="ddG")]
+
+# ID as character variable
+data$ID<-as.character(data$ID)
+
+return(list("data"=data, "epoxide"=epx))
+}
+```
+
+Preprocess
+
+```{r prep}
+df.s.l<-prep.f(df.s)
+df.c.l<-prep.f(df.c, "Cyclic Epoxide")
+df.a.l<-prep.f(df.a, "Aliphatic Epoxide")
+
+```
+
+# Yield and ddG by Class and Denticity 
+
+Define df.out.m.f to be a function that will melt the output (yield) and append it to the dataframe list. 
+
+```{r melt_output}
+
+# Melt yield and ddG 
+df.out.m.f<-function(df.list){
+  # Call df 
+  df<-df.list[[1]]
+  
+  # melt 
+  df.m<-melt(df, 
+             measure.vars=c("Yield"))
+  # append to end of list 
+  df.list<-c(df.list, "melted.output"=list(df.m))
+
+  return((df.list))
+}
+
+  # apply function 
+  df.s.l<-df.out.m.f(df.s.l)
+    
+  df.c.l<-df.out.m.f(df.c.l)
+  df.a.l<-df.out.m.f(df.a.l)
+```
+
+Define `plot.out.f` to be a function that will call in the melted dataframe and plot the output yield by ligand class. 
+
+```{r plot output}
+# define function for plotting ddG and yield 
+
+plot.out.f<-function(df.list=df.s.l, x="Class"){
+  # Call df 
+  melted_df<-df.list[[3]]
+  
+  # call epx labeller
+  epx<-df.list[[2]]
+  
+  # Find index of x
+  x.ind<-which(colnames(melted_df)==x)
+  
+  # Plot
+   ggplot(melted_df) + 
+  geom_boxplot(aes(melted_df[,x.ind], value, 
+                   color=melted_df[,x])) +
+  theme(legend.position = "none") +
+  ggtitle(epx) + 
+     ylab("Yield")+
+   xlab(x) + 
+       facet_grid(rows=vars(variable), scales="free")
+}
+```
+
+Apply above function and arrange in grid. 
+
+```{r plot output}
+# Arrange in grid 
+grid.arrange(grobs=list(
+  plot.out.f(), 
+  plot.out.f(df.c.l), 
+  plot.out.f(df.a.l)
+))
+
+```
+
+
+#  Feature Scaling 
+
+Before proceeding with PCA, data will be scaled. The values of each parameter will be converted into a Z score. ddG will be removed since it is not a feature. 
+
+* `df.num`: unscaled dataframe with non-numerical features removed 
+* `df.sc0`: scaled dataframe containing scaled outputs 
+* `df.sc`: scaled dataframe without scaled outputs 
+* `df.sc.f`: scaled dataframe with scaled outputs and non-numerical features 
+
+```{r}
+scale.f<-function(df.list){
+  # call df 
+  df<-df.list[[1]]
+  
+  # Remove non-numeric/integer parameters 
+  df.num<-df[,-c(
+  grep("ID", colnames(df)), 
+  grep("Class", colnames(df)), 
+  grep("dent", colnames(df))
+)]
+
+# Center and Scale input matrix
+df.sc0<-scale(df.num)
+   
+  # save scaled ddG and yield data 
+  ddg.sc<-as.data.frame(df.sc0)$ddG
+  yield.sc<-as.data.frame(df.sc0)$yield
+  
+
+# Save scaling attributes (i.e. mean and sd of each feature)
+sc.att<-list(scale=attr(df.sc0, "scaled:scale"), 
+                center=attr(df.sc0, "scaled:center"))
+
+
+#Save as data.frame, remove yield and ddG
+df.sc<-as.data.frame(df.sc0)
+
+df.sc<-df.sc[,-c(
+  grep("Yield", colnames(df.sc)), 
+  grep("ddG", colnames(df.sc))
+)]
+
+# Make full scaled df
+df.sc.f<-data.frame("ID"=df$ID, 
+                    "Class"=df$Class, 
+                    "dent"=df$dent, 
+                    df.sc0)
+
+return(list(df.num, df.sc0, ddg.sc, yield.sc, sc.att, df.sc, df.sc.f))
+}
+```
+
+Apply scaling. 
+
+```{r scale}
+df.s.sc.l<-scale.f(df.s.l)
+df.c.sc.l<-scale.f(df.c.l)
+df.a.sc.l<-scale.f(df.a.l)
+```
+
+# Heatmap 
+Construct heatmap using `pheatmap` package. Define `heatmap.f` function. 
+
+* `title`: a character string  
+*`sc`: is a character string for column-, row-wise scaling or none; takes on the values `column`, `row`, or `none`. 
+
+```{r heatmap}
+
+heatmap.f<-function(df.sc.list, title="PARC Feature Set, LNiArCl (Ar= Ph),", 
+                    sc="column"){
+  
+  # Call scaled df without output 
+  df.sc<-df.sc.list[[6]]
+  df.full<-df.sc.list[[7]]
+  
+  # row labels 
+  rlab<-paste0(df.full$ID, ",", df.full$Class)
+  
+  a<-pheatmap(df.sc, scale=sc, 
+              main=paste(c(title, sc,"-wise scaling"), 
+                                          collapse = ""), 
+              labels_row=rlab,
+         color=hcl.colors(100, palette="prgn")
+         )
+  
+  return(a)
+}
+
+# apply; Styrene and cyclic have same features 
+heatmap.f(df.s.sc.l, sc="column")
+heatmap.f(df.a.sc.l)
+```
+
+# Correlation Map 
+
+Make correlation plot, colored by magnitude of correlation of a given pair ($-1 \le R \le 1$). 
+
+`corrmap.f` function takes the scaled list, namely `df.num`, and returns the correlation matrix, the correlation plot, and a melted correlation matrix. 
+
+```{r corr}
+corrmap.f<-function(df.sc.list){
+  # call df 
+  df<-df.sc.list[[1]]
+  
+  # find correlation, rounded 
+  cormat<-round(
+    cor(df), 2
+  )
+  
+  # ablate lower triangle 
+  cormat[lower.tri(cormat)]<-NA
+  
+  # melt 
+  cormat.m<-melt(cormat)
+  
+
+  # Plot 
+  p<-ggplot(cormat.m, 
+         aes(x=Var1, y=Var2, fill=value)) + 
+    geom_tile(color="white") + 
+    scale_fill_gradient2(low = "turquoise", high = "salmon", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+   name="Pearson\nCorrelation") + 
+    theme(axis.text.x=element_text(angle=-75, hjust=0, 
+                                   vjust=-0.75)) + 
+    ggtitle("Correlation Plot, Ni m06/def2tzvp") + 
+    ylab("") + 
+    xlab("")
+  
+  return(list(cormat, p, cormat.m))
+}
+```
+
+Apply `corrmap.f()`. Note that with the exception of yield and ddG, the Styrene and cyclic datasets are identical and hence, the correlation plots are nearly the same. The aliphatic datasets has L29, the thioamide, removed. 
+
+```{r corrmap_apply}
+cor.s.l<-corrmap.f(df.s.sc.l)
+  cor.s.l[[2]]
+cor.c.l<-corrmap.f(df.c.sc.l)
+cor.a.l<-corrmap.f(df.a.sc.l)
+  cor.a.l[[2]]
+```
+
+Find highly correlated features, defined to have $|R|>0.5$. 
+
+```{r coll_f}
+# find high correlations 
+coll.f<-function(cor.list, min=0.5){
+  # melt 
+    cor.m<-na.omit(melt(cor.list[[1]]))
+    
+  # order by descending magnitude of r
+    cor.m<-cor.m[order(-abs(cor.m$value)),]
+    
+  return(cor.m[cor.m$value<1&cor.m$value>=min,])
+}
+```
+
+Apply `coll.f()`. 
+
+```{r coll_f_apply}
+# Styrene
+
+coll.s<-coll.f(cor.s.l)
+  
+  # Remove outputs
+  coll.s<-coll.s[coll.s$Var1!="Yield"&coll.s$Var1!="ddG",]
+  
+# Cyclic 
+coll.c<-coll.f(cor.c.l)
+
+# Aliphatic
+
+ coll.a<-coll.f(cor.a.l)
+    coll.a<-coll.a[coll.a$Var1!="Yield"&coll.a$Var1!="ddG",]
+    
+```
+
+Correlation with yield and ddG: 
+
+```{r output}
+corr.s.out<-data.frame("Yield Correlation"=cor.s.l[[1]][1,], 
+                       "ddG Correlation"=cor.s.l[[1]][2,])
+
+corr.c.out<-data.frame("Yield Correlation"=cor.c.l[[1]][1,], 
+                       "ddG Correlation"=cor.c.l[[1]][2,])
+
+corr.a.out<-data.frame("Yield Correlation"=cor.a.l[[1]][1,], 
+                       "ddG Correlation"=cor.a.l[[1]][2,])
+
+corr.s.out[order(-abs(corr.s.out$ddG.Correlation)), ]
+  write_clip(corr.c.out[order(-abs(corr.c.out$Yield.Correlation)), ])
+
+corr.c.out[order(-abs(corr.c.out$Yield.Correlation)), ]
+
+corr.a.out[order(-abs(corr.a.out$Yield.Correlation)), ]
+
+```
+
+## Plot Some heavily correlated Features with Output
+
+```{r}
+out.corr.l<-list(ggplot(df.s, 
+       aes(x=VBur, y=Yield, color=Class))+
+  geom_point() + 
+  ggtitle("Styrene Oxides"), 
+
+  ggplot(df.c, 
+       aes(x=Vol_Ni, y=Yield, color=Class))+
+  geom_point() + 
+  ggtitle("Cyclic Epoxides"), 
+
+  ggplot(df.a, 
+       aes(x=NiN.len_rg, y=Yield, color=Class))+
+  geom_point() + 
+  ggtitle("Aliphatic Epoxides")) 
+
+# Arrange on Matrix
+grid.arrange(grobs=out.corr.l)
+
+# Now do some transformations on yiled and ddG 
+out.corrln.l<-list(
+  
+  ggplot(df.s, 
+       aes(x=VBur, y=log(Yield), color=Class))+
+  geom_point() + 
+  ggtitle("Styrene Oxides") +
+    ylab("ln(Yield)"), 
+  
+  ggplot(df.c, 
+       aes(x=Vol_Ni, y=log(Yield), color=Class))+
+  geom_point() + 
+  ggtitle("Cyclic Epoxides")+
+    ylab("ln(Yield)"), 
+  
+  ggplot(df.a, 
+       aes(x=NiN.len_rg, y=log(Yield), color=Class))+
+  geom_point() + 
+  ggtitle("Aliphatic Epoxides")+
+    ylab("ln(Yield)"))
+
+# Arrange on Matrix
+grid.arrange(grobs=out.corrln.l, nrow=3)
+  
+  
+```
+
+# Correlation 
+
+# Principal Component Analysis 
+
+Use `prcomp()` to conduct PCA on the input matrix. 
+
+```{r pca}
+pca<-prcomp(df.s.sc.l[[6]])
+```
+
+Find eigenvalues and construct Scree plot. 
+```{r eigenvalue_var}
+# check for variation accounted for by each PC (this is equal to the eigenvalue)
+pca.var<-pca$sdev^2
+  # calculate percentage 
+  pca.var.per<-round(pca.var/sum(pca.var)*100, 
+                     1)
+# Display 
+pca.var.per
+```
+
+Construct Scree plot. 
+
+```{r scree}
+  # df wrangling
+  df.pca.scree<-data.frame(
+    PC=seq(1:length(pca.var.per)), 
+    "Percent Var Captured"=pca.var.per, 
+    "Eigenvalue"=round(pca.var, 2)
+  )
+  
+    levels(df.pca.scree$PC)<-df.pca.scree$PC
+    
+  
+  # scree plot 
+  ggplot(df.pca.scree, 
+         aes(x=PC, 
+             y=Percent.Var.Captured)) + 
+    geom_bar(stat="identity") + 
+    geom_text(aes(label=Percent.Var.Captured), 
+              vjust=-1) + 
+    ggtitle(paste0(c(
+      "Scree Plot,", df.a.l[[2]]
+    ), collapse=" ")) + 
+    scale_x_continuous(breaks=1:nrow(df.pca.scree)) + 
+    ylab("Percent Variation Captured")
+```
+
+PC Plots; (here, of the first two principal components)
+
+```{r PC_plot}
+# ggplot2
+  # Make df for ggplot()
+  pca.df<-data.frame(
+    'ID'=df.s.l[[1]]$ID, 
+    "PCA1"=pca$x[,1], 
+    'PCA2'=pca$x[,2], 
+    "Class"=df.s.l[[1]]$Class
+  )
+  
+  # plot 
+  pca12<-ggplot(pca.df, 
+         aes(x=PCA1, 
+             y=PCA2, 
+             label=ID, 
+             color=Class))+
+    geom_point()+
+    xlab(paste(
+      "PC1-", pca.var.per[1], "%", sep=""
+    )) + 
+    ylab(paste(
+      "PC2-", pca.var.per[2], "%", sep=""
+    )
+    ) + 
+    ggtitle(paste(c(
+      "Principal Component Analysis,", "LNiArCl M06/def2TZVP"), 
+      collapse=" ")) 
+  
+  # Display plot 
+  pca12
+  
+  # Can also add ID labels 
+  pca12+geom_text(vjust=1, hjust=1, size=3, angle=-10)
+```
+
+Calculate feature loadings with `load.scores.f()`
+
+* `i`: the $i^{th}$ principal component 
+* `k`: the top $k$ features with the largest magnitude 
+
+```{r load_scores_f}
+load.scores.f<-function(i, k=10,
+                        pca_output){
+  # Check magnitude by taking absolute value 
+  load.scores<-abs(pca_output$rotation[,i]
+                   )
+  # sort loading scores in decreasing magnitude 
+  load.scores.ranked<-round(sort(load.scores, 
+                           decreasing=T), 
+                           3)
+  
+  # Find first k features
+  top.k.features<-names(load.scores.ranked)[1:k]
+  
+  # check their loading scores (+/-)
+  
+    return( list('Loading Score Magnitudes, Ranked'=load.scores.ranked,
+                 "Top Features and Loading Scores"=pca_output$rotation[top.k.features, i])
+    )
+}
+```
+
+
+```{r pca_load_scores}
+# Check loading scores for PC1 and PC2
+load.pc1<-load.scores.f(i=1, 
+                        k=ncol(df.s.sc.l[[6]]), 
+                        pca)[[2]]
+load.pc2<-load.scores.f(i=2, 
+                        k=ncol(df.s.sc.l[[6]]), 
+                        pca)[[2]]
+kable(load.pc1)
+kable(load.pc2)
+    
+```
+
+Plot the loading scores of PC1 and PC2. 
+
+```{r loading_plot}
+# create data frame for ggplot 
+df.load.gg0<-data.frame(
+  "Feature"=c(
+    names(load.pc1),
+    names(load.pc2)
+  ), 
+  "Loading Score"=c(
+    load.pc1, 
+    load.pc2
+  ), 
+  "PC"=rep(c(1,2), 
+           each=length(load.pc1))
+)
+  
+  # reshape 
+  df.load.gg<-dcast(df.load.gg0,
+                    Feature~PC, 
+                    value.var = "Loading.Score")
+    # rename columns 
+    colnames(df.load.gg)[2:3]<-c(
+      "PC1", "PC2"
+    )
+    
+    #Plot 
+    ggplot(df.load.gg, 
+           aes(x=PC1,
+      y=PC2, 
+      color=Feature)) + 
+    geom_point(alpha=0.6) + 
+      xlim(-0.4, 0.4) + 
+      ggtitle(paste(
+        c("Feature Loading Scores of PC1 and PC2,", "Nickel M06/def2tzvp"), collapse=" "
+      ))  +
+      geom_text(aes(label=Feature), 
+                 hjust=-.2, 
+                 vjust=0.5, size=3, 
+                angle=-10)
+  
+```
